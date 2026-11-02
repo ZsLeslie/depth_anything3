@@ -6,6 +6,8 @@ __pycache__/
 workspace/
 build/
 dist/
+images/
+tests/
 *.egg-info/
 .gradio/
 
@@ -22,6 +24,7 @@ eval_workspace/
 FILTER*/
 input_images*/
 *.gradio/
+jetson-constraints.txt
 
 # Jupyter notebooks
 .ipynb_checkpoints

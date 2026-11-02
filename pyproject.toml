@@ -20,6 +20,8 @@ dependencies = [
     "huggingface_hub",
     "imageio",
     "numpy<2",
+    "scipy>=1.8",
+    "matplotlib",
     "opencv-python",
     "xformers",
     "open3d",
