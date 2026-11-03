@@ -1,4 +1,4 @@
-"""Preview axial/circumferential curves on a fitted DA3 surface."""
+"""Preview section/grid curves on a fitted surface or an unmodified DA3 depth mesh."""
 
 from __future__ import annotations
 
@@ -10,6 +10,52 @@ import numpy as np
 from depth_anything_3.axis import image_from_surface, load_surface, project
 from depth_anything_3.utils.grid import build_grid, pack_paths, visible_fragments
 from depth_anything_3.utils.pointcloud import write_ply
+
+
+def load_raw_mesh(path, *, max_relative_jump=0.1, confidence_min=None):
+    """Build adjacent-pixel triangles without fitting or smoothing raw vertices.
+
+    fitted_points/inlier are compatibility keys for the shared renderer: here
+    they mean raw camera points/observed validity, never spline fit or residuals.
+    """
+    from depth_anything_3.surface import load_cloud
+    from depth_anything_3.utils.surface import triangulate_surface
+
+    data = load_cloud(path)
+    points, uv = data["points"], data["pixels_uv"]
+    h, w = data["valid_mask"].shape
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N,3)")
+    if uv.shape != (len(points), 2) or uv.dtype.kind not in "iu":
+        raise ValueError("pixels_uv must be integer (N,2)")
+    if np.any(uv < 0) or np.any(uv >= [w, h]):
+        raise ValueError("pixels_uv falls outside valid_mask")
+    if len(np.unique(uv[:, 1]*w + uv[:, 0])) != len(uv):
+        raise ValueError("Duplicate pixels in point cloud")
+    K = data["intrinsics"]
+    if (K.shape != (3, 3) or not np.isfinite(K).all() or
+            not np.allclose(K[2], [0, 0, 1]) or min(K[0, 0], K[1, 1]) <= 0 or
+            abs(np.linalg.det(K)) < 1e-12):
+        raise ValueError("Expected finite invertible pinhole intrinsics")
+    valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 0)
+    valid &= data["valid_mask"][uv[:, 1], uv[:, 0]].astype(bool)
+    if confidence_min is not None:
+        if not np.isfinite(confidence_min) or "confidence" not in data:
+            raise ValueError("confidence-min requires a finite threshold and saved confidence")
+        confidence = data["confidence"]
+        if confidence.shape != (len(points),):
+            raise ValueError("confidence must have shape (N,)")
+        valid &= np.isfinite(confidence) & (confidence >= confidence_min)
+    if not valid.any():
+        raise ValueError("Point cloud has no valid camera-depth observations")
+    if np.max(np.abs(project(points[valid], K) - uv[valid])) > 0.05:
+        raise ValueError("Point cloud does not match pixels and intrinsics")
+    data.update(image_shape=np.array([h, w]), fitted_points=points, inlier=valid,
+                coordinates=np.asarray("camera"))
+    data["faces"] = triangulate_surface(data, step=1, max_relative_jump=max_relative_jump)
+    if not len(data["faces"]):
+        raise ValueError("No adjacent-pixel mesh remains; use a dense point cloud or inspect filtering")
+    return data
 
 
 def curve_color(family, line):
@@ -85,10 +131,12 @@ def save_validation(out, data, fields, frame, paths, families, lines, overlay, r
     ax = fig.add_subplot(2, 2, 1)
     ax.imshow(overlay)
     ax.set_title("Sparse preview on the processed image")
-    ax.legend(handles=[Line2D([], [], color=np.array(curve_color(0, 0))/255, label="sections"),
+    legend = [Line2D([], [], color=np.array(curve_color(0, 0))/255, label="sections")]
+    if not report.get("sections_only", False):
+        legend += [
                        Line2D([], [], color=np.array(curve_color(1, 1))/255, label="longitudinal"),
-                       Line2D([], [], color=np.array(curve_color(1, 0))/255, label="theta=0")],
-              fontsize=8, loc="lower left")
+                       Line2D([], [], color=np.array(curve_color(1, 0))/255, label="theta=0")]
+    ax.legend(handles=legend, fontsize=8, loc="lower left")
     h, w = data["image_shape"]
     u, v = data["pixels_uv"].T
     theta = np.full((h, w), np.nan)
@@ -120,6 +168,7 @@ def save_validation(out, data, fields, frame, paths, families, lines, overlay, r
     ax.axis("off")
     import textwrap
     text = ["PREVIEW - candidate axis is not physically verified",
+            f"Geometry: {report.get('geometry_source', 'fitted_surface')}",
             f"Axis state: {report['axis_status']}",
             f"Sections / angular sectors: {report['sections']} / {report['sectors']}",
             f"Mesh-connected curves: {report['geometric_components']}",
@@ -135,7 +184,13 @@ def save_validation(out, data, fields, frame, paths, families, lines, overlay, r
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--surface", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--surface", type=Path, help="Fitted surface archive")
+    source.add_argument("--pointcloud", type=Path, help="Raw pixel-linked point cloud archive")
+    parser.add_argument("--sections-only", action="store_true", help="Only intersect transverse planes")
+    parser.add_argument("--max-relative-jump", type=float, default=0.1,
+                        help="Raw mesh relative depth discontinuity threshold (default 0.1)")
+    parser.add_argument("--confidence-min", type=float, help="Optional raw point confidence threshold")
     parser.add_argument("--axis", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/grid"))
     parser.add_argument("--sections", type=int, default=5)
@@ -160,9 +215,13 @@ def main():
         parser.error("visibility-tolerance must be finite and nonnegative")
     if (args.resize_only or args.processed_to_original) and args.original_image is None:
         parser.error("Image mapping requires --original-image")
+    if args.surface and (args.confidence_min is not None or args.max_relative_jump != 0.1):
+        parser.error("confidence-min and max-relative-jump apply only to --pointcloud")
     try:
         from PIL import Image
-        data = load_surface(args.surface)
+        data = (load_raw_mesh(args.pointcloud, max_relative_jump=args.max_relative_jump,
+                              confidence_min=args.confidence_min)
+                if args.pointcloud else load_surface(args.surface))
         axis = json.loads(args.axis.read_text())
         if axis.get("coordinates") != "camera":
             raise ValueError("Axis must be in camera coordinates")
@@ -189,6 +248,7 @@ def main():
         frame, fields, paths, families, lines, details = build_grid(
             data["fitted_points"], data["faces"], axis, sections=args.sections, sectors=args.sectors,
             zero_vector=zero_vector, zero_angle_degrees=args.zero_angle_deg, s_range=args.s_range,
+            sections_only=args.sections_only,
         )
         visible, vf, vl = [], [], []
         for path, family, line in zip(paths, families, lines):
@@ -237,9 +297,17 @@ def main():
             )
         if not visible:
             warnings.append("No visible grid fragments remain; inspect surface support and axial range")
-        report = {"surface": str(args.surface.resolve()), "axis": str(args.axis.resolve()),
+        report = {"surface": str(args.surface.resolve()) if args.surface else None,
+                  "pointcloud": str(args.pointcloud.resolve()) if args.pointcloud else None,
+                  "geometry_source": "raw_depth_mesh" if args.pointcloud else "fitted_surface",
+                  "mesh_faces": len(data["faces"]),
+                  "mesh_vertices_used": len(np.unique(data["faces"])),
+                  "max_relative_jump": args.max_relative_jump if args.pointcloud else None,
+                  "confidence_min": args.confidence_min,
+                  "sections_only": args.sections_only, "axis": str(args.axis.resolve()),
                   "axis_status": axis.get("status", "unknown"), "preview_only": True,
-                  "sections": args.sections, "sectors": args.sectors,
+                  "sections": args.sections, "sectors": 0 if args.sections_only else args.sectors,
+                  "section_spacing": float(np.diff(frame["section_levels"])[0]),
                   "geometric_components": len(paths), "visible_fragments": len(visible),
                   "visible_longitudinal_ids": sorted(set(map(int, vl[vf == 1]))),
                   "ambiguous_longitudinal_ids": ambiguous, "warnings": warnings,
@@ -249,6 +317,18 @@ def main():
                   "processed_to_original": transform.tolist() if transform is not None else None}
         out = args.output_dir
         out.mkdir(parents=True, exist_ok=True)
+        if args.pointcloud:
+            # Preserve original point order and vertices for reproducible mesh inspection.
+            np.savez_compressed(out / "raw_mesh.npz", points=data["points"], faces=data["faces"],
+                                pixels_uv=data["pixels_uv"], valid=data["inlier"],
+                                intrinsics=data["intrinsics"], image_shape=data["image_shape"],
+                                coordinates=np.asarray("camera"))
+            used = np.unique(data["faces"])
+            lookup = np.full(len(data["points"]), -1, dtype=np.int32)
+            lookup[used] = np.arange(len(used))
+            write_ply(out / "raw_mesh.ply", data["points"][used],
+                      data["colors"][used] if "colors" in data else None,
+                      faces=lookup[data["faces"]])
         Image.fromarray(overlay).save(out / "grid_overlay.png")
         if original is not None:
             Image.fromarray(original).save(out / "grid_overlay_original.png")

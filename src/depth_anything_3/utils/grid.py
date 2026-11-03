@@ -186,7 +186,7 @@ def radial_ambiguity(paths, center, direction, radial_direction, s_range, tolera
 
 
 def build_grid(points, faces, axis, *, sections=5, sectors=12, zero_vector=None,
-               zero_angle_degrees=0., s_range=None):
+               zero_angle_degrees=0., s_range=None, sections_only=False):
     points, faces = np.asarray(points, float), np.asarray(faces)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must have shape (N,3)")
@@ -213,7 +213,7 @@ def build_grid(points, faces, axis, *, sections=5, sectors=12, zero_vector=None,
     min_radius = max(scale * 1e-6, 1e-10)
     s, theta, radius, valid = surface_coordinates(points, center, a, e1, e2, min_radius)
     levels = np.linspace(*bounds, sections)
-    angles = np.arange(sectors) * (2 * np.pi / sectors)
+    angles = np.empty(0) if sections_only else np.arange(sectors) * (2 * np.pi / sectors)
     paths, family_ids, line_ids, diagnostics = [], [], [], []
     for family, values in enumerate((levels, angles)):
         for line_id, value in enumerate(values):

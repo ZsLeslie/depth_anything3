@@ -22,7 +22,31 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
 
 需要 NumPy、SciPy、OpenCV、Pillow；诊断图还使用 Matplotlib。`--no-plots` 跳过诊断图，仍保存网格叠加图。
 
-`--surface` 和 `--axis` 都是必需参数。程序校验二者的相机内参与处理尺寸是否一致；同尺寸、同内参不能证明属于同一帧，因此调用时仍需配对使用同一图像的结果。输出目录中同名文件会覆盖。
+`--surface` 和 `--pointcloud` 必须二选一，`--axis` 必需。程序校验输入几何与轴线的相机内参、处理尺寸是否一致；同尺寸、同内参不能证明属于同一帧，因此调用时仍需配对使用同一图像的结果。输出目录中同名文件会覆盖。
+
+## 原始深度网格的横向切片
+
+直接读取第一步点云，以相邻像素组成三角形，保持原始深度和三维顶点不变，不执行曲面拟合或曲线平滑。沿同一轴线的同一范围放置等距平面，求交后仅绘制青色横向线：
+
+```bash
+PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
+  /home/nvidia/venvs/da3_env/bin/python -m depth_anything_3.grid \
+  --pointcloud outputs/1920/pointcloud/frame_0000.npz \
+  --axis outputs/1920/axis_annotate/axis.json \
+  --sections-only --sections 5 \
+  --max-relative-jump 0.1 \
+  --original-image images/1920_45_000001.jpg --resize-only \
+  --output-dir outputs/1920/grid_raw_sections
+```
+
+- `--sections-only` 适用于两种输入，不计算或绘制纵向线。截面间距为 `(s_max-s_min)/(sections-1)`，单位是重建坐标单位。
+- 原始网格使用步长 1，仅连接完整的相邻像素单元。无效像素、邻域深度跳变或三角形内部相对深度跨度超过 `--max-relative-jump` 的区域断开，不跨洞补线。稀疏采样点云可能无法形成相邻像素网格，应使用第一步 `--stride 1` 输出。
+- 默认保留输入点云的有效观测，不使用拟合残差掩码。可以加 `--confidence-min` 过滤保存的 DA3 置信度；它不是标定后的概率。
+- 可见性检查使用原始深度，线宽裁剪使用原始观测有效区域。此处 `coordinates.npz` 中兼容字段 `inlier` 表示观测有效性，不表示拟合内点。
+- 额外输出 `raw_mesh.npz`（原始顶点顺序、三角形索引、有效性和相机信息）及 `raw_mesh.ply`，可检查实际参与求交的网格。报告记录几何来源、面数、过滤阈值和截面间距。
+- 平滑但错误的深度连接仍可能形成三角形；没有精确掩码时不能保证识别左右壁面与中间腹板。原始曲线可能出现抖动、小闭环或多分支，应先观察，不自动抹平。
+
+对比拟合曲面时，把 `--pointcloud ...` 改为 `--surface outputs/1920/surface/surface.npz`，保持轴线、范围、截面数和绘制参数相同，并使用不同输出目录。两者的支持区域不同：原始版本不使用拟合残差过滤，不能把线条更完整直接解释为几何更准确。
 
 ## 预览颜色与文件
 
@@ -73,7 +97,7 @@ radius = sqrt(x²+y²)
 
 ## 可见性与原图映射
 
-曲线按最多 0.5 个处理图像像素的间隔进行透视正确采样。采样点必须位于第二步的有效区域，且其 z 深度与该像素的拟合深度相差不超过默认 3%。无效区域或深度不一致处会断开，线宽覆盖区域也被有效掩码裁剪。
+曲线按最多 0.5 个处理图像像素的间隔进行透视正确采样。采样点必须位于输入几何的有效区域，且其 z 深度与该像素的深度相差不超过默认 3%（曲面模式使用拟合深度，点云模式使用原始深度）。无效区域或深度不一致处会断开，线宽覆盖区域也被有效掩码裁剪。
 
 这里的掩码来自几何有效性，不要求分割模型。可见性检查仍依赖 DA3：如果深度没有恢复某个线缆、灯具等遮挡物，不能保证自动避开该物体。
 
