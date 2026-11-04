@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from depth_anything_3.utils.axis import (
-    axis_basis, direction_from_parallel_lines, estimate_axis, mesh_sections,
+    axis_basis, camera_z_axis, direction_from_parallel_lines, estimate_axis, mesh_sections,
     section_diagnostics, unit_direction,
 )
 from depth_anything_3.utils.pointcloud import write_ply
@@ -167,19 +167,21 @@ def save_visualizations(output, data, axis, report, geometry):
         ax.imshow(image_from_surface(data))
         ax.add_collection(LineCollection(segments_uv[visible], colors=section_colors[ids[visible]],
                                          linewidths=1.6))
-        ax.plot(axis_uv[:, 0], axis_uv[:, 1], "--", color="#ff42e0", linewidth=2,
-                label="candidate axis (through empty space)")
+        fixed_z = axis.get("axis_source") == "camera_z"
+        if not fixed_z:
+            ax.plot(axis_uv[:, 0], axis_uv[:, 1], "--", color="#ff42e0", linewidth=2,
+                    label="candidate axis (through empty space)")
         a = np.asarray(axis["direction"])
         vp = data["intrinsics"] @ a
         vp = vp[:2] / vp[2]
         if 0 <= vp[0] < w and 0 <= vp[1] < h:
-            ax.plot(*vp, marker="x", color="cyan", markersize=9,
-                    label="direction vanishing point (model)")
+            ax.plot(*vp, marker="x", color="#ff42e0" if fixed_z else "cyan", markersize=9,
+                    label="camera Z axis / principal point" if fixed_z else "direction vanishing point (model)")
         for line in report.get("annotations", {}).get("processed_lines", []):
             uv = np.asarray(line)
             ax.plot(uv[:, 0], uv[:, 1], "o-", color="yellow", linewidth=1)
         ax.set(xlim=(0, w - 1), ylim=(h - 1, 0), xlabel="processed image u", ylabel="v",
-               title="Candidate axis and supported cross-sections")
+               title="Fixed camera Z axis: constant-depth sections" if fixed_z else "Candidate axis and supported cross-sections")
         ax.legend(fontsize=8, loc="lower left")
 
     fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
@@ -225,12 +227,16 @@ def save_visualizations(output, data, axis, report, geometry):
     ax = fig.add_subplot(2, 2, 4)
     ax.axis("off")
     stats, stability = report["selected_validation"], report["stability"]
+    residual_text = (
+        f"Median / P90 model residual: {100 * stats['median_error_over_radius']:.1f}% / "
+        f"{100 * stats['p90_error_over_radius']:.1f}% of radius"
+        if stats is not None else "Model residual: not assessed (no axis fitting)"
+    )
     text = [f"Status: {report['status']} (physical axis not verified)",
             f"Selected hypothesis: {axis['candidate_model']}",
             f"Direction: {np.round(axis['direction'], 4)}",
             f"Reference point: {np.round(axis['point'], 4)}",
-            f"Median / P90 model residual: {100 * stats['median_error_over_radius']:.1f}% / "
-            f"{100 * stats['p90_error_over_radius']:.1f}% of radius",
+            residual_text,
             f"Resamples: {stability['successful']}/{stability['requested']}",
             "P95 direction change: " + (
                 f"{stability['direction_p95_degrees']:.3f} deg"
@@ -252,6 +258,8 @@ def main():
     parser.add_argument("--direction", nargs=3, type=float, metavar=("AX", "AY", "AZ"))
     parser.add_argument("--axis-point", nargs=3, type=float, metavar=("X", "Y", "Z"))
     parser.add_argument("--axis-json", type=Path, help="Load point/direction as fixed manual constraints")
+    parser.add_argument("--camera-z-axis", action="store_true",
+                        help="Use the fixed camera axis x=y=0, direction [0,0,1]; skip axis fitting")
     annotations = parser.add_mutually_exclusive_group()
     annotations.add_argument("--annotations", type=Path, help="JSON of physically parallel lines")
     annotations.add_argument("--annotate", action="store_true", help="Open desktop line point picker")
@@ -266,6 +274,8 @@ def main():
         parser.error("sections must be between 2 and 30")
     if (args.annotations or args.annotate) and (args.direction or args.axis_json):
         parser.error("Use annotations OR explicit direction/axis-json, not both")
+    if args.camera_z_axis and (args.direction or args.axis_point or args.axis_json or args.annotations or args.annotate):
+        parser.error("camera-z-axis cannot be combined with manual axis or reference-line options")
     try:
         data = load_surface(args.surface)
         direction, point = args.direction, args.axis_point
@@ -286,11 +296,14 @@ def main():
                 annotation, data["intrinsics"], data["image_shape"],
             )
         keep = data["inlier"]
-        axis, report, bootstrap_axes = estimate_axis(
-            data["points"][keep], data["normals"][keep], validation=data["validation"][keep],
-            max_samples=args.max_samples, bootstrap=args.bootstrap, seed=args.seed,
-            direction=direction, axis_point=point, normal_weight=args.normal_weight,
-        )
+        if args.camera_z_axis:
+            axis, report, bootstrap_axes = camera_z_axis(data["fitted_points"][np.unique(data["faces"])])
+        else:
+            axis, report, bootstrap_axes = estimate_axis(
+                data["points"][keep], data["normals"][keep], validation=data["validation"][keep],
+                max_samples=args.max_samples, bootstrap=args.bootstrap, seed=args.seed,
+                direction=direction, axis_point=point, normal_weight=args.normal_weight,
+            )
         a, c = unit_direction(axis["direction"]), np.asarray(axis["point"])
         # Only the supported mesh contributes to section placement.
         used = np.unique(data["faces"])
@@ -314,12 +327,14 @@ def main():
         if report["warnings"]:
             report["status"] = "needs_review"
         report.update({"surface": str(args.surface.resolve()),
-                       "residual_units": "geometric distance divided by median model radius",
+                       "residual_units": None if args.camera_z_axis else "geometric distance divided by median model radius",
                        "scope": "Diagnostic axis and sections; not a final inspection grid"})
         axis.update({"s_range": [float(lo), float(hi)], "section_levels": levels.tolist(),
                      "status": report["status"], "accepted_as_physical_axis": False,
                      "intrinsics": data["intrinsics"].tolist(),
                      "image_shape": data["image_shape"].tolist()})
+        if args.camera_z_axis:
+            axis["section_depths"] = (c[2] + levels).tolist()
         axis_line = c + np.linspace(lo, hi, 200)[:, None] * a
         geometry = {"segments": segments, "section_ids": section_ids, "levels": levels,
                     "axis_line": axis_line, "bootstrap_axes": bootstrap_axes,
