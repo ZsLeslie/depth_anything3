@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from depth_anything_3.utils.pointcloud import write_ply
-from depth_anything_3.utils.surface import fit_surface, triangulate_surface
+from depth_anything_3.utils.surface import fit_surface, fit_surface_regions, triangulate_surface
 
 
 def load_cloud(path: Path) -> dict[str, np.ndarray]:
@@ -130,18 +130,40 @@ def main() -> None:
     parser.add_argument("--mesh-step", type=int, default=3)
     parser.add_argument("--max-relative-jump", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--regions", type=Path, help="Polygon region annotation JSON")
+    parser.add_argument("--annotate-regions", action="store_true",
+                        help="Open polygon editor, optionally edit --regions, then fit")
+    parser.add_argument("--annotation-image", type=Path, help="Optional original image for polygon editor")
+    mapping = parser.add_mutually_exclusive_group()
+    mapping.add_argument("--annotation-resize-only", action="store_true",
+                         help="Assert annotation image differs only by resize, with no crop")
+    mapping.add_argument("--annotation-to-processed", type=Path, help="JSON 3x3 annotation-to-depth image transform")
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
+    if not args.annotate_regions and (args.annotation_image or args.annotation_resize_only or args.annotation_to_processed):
+        parser.error("Annotation display options require --annotate-regions")
     try:
         data = load_cloud(args.pointcloud)
-        model, arrays, report = fit_surface(
-            data["points"], data["pixels_uv"], data["intrinsics"], data["valid_mask"].shape,
+        annotation = json.loads(args.regions.read_text()) if args.regions else None
+        if args.annotate_regions:
+            from depth_anything_3.surface_regions import annotate_regions
+            annotation = annotate_regions(
+                data, args.output_dir / "regions.json", initial=annotation, image_path=args.annotation_image,
+                resize_only=args.annotation_resize_only,
+                matrix=json.loads(args.annotation_to_processed.read_text()) if args.annotation_to_processed else None,
+            )
+        options = dict(
             confidence=data.get("confidence"), confidence_min=args.confidence_min,
             controls=(args.controls_u, args.controls_v), smoothness=args.smoothness,
             max_samples=args.max_samples, iterations=args.iterations,
             relative_threshold=args.relative_threshold, validation_block=args.validation_block,
             seed=args.seed,
         )
+        inputs = (data["points"], data["pixels_uv"], data["intrinsics"], data["valid_mask"].shape)
+        if annotation is None:
+            model, arrays, report = fit_surface(*inputs, **options)
+        else:
+            model, arrays, report = fit_surface_regions(*inputs, annotation, **options)
         if "colors" in data:
             arrays["colors"] = data["colors"]
         if "confidence" in data:
@@ -149,12 +171,23 @@ def main() -> None:
         arrays["faces"] = triangulate_surface(
             arrays, step=args.mesh_step, max_relative_jump=args.max_relative_jump,
         )
+        if annotation is not None:
+            arrays["face_region_ids"] = arrays["region_ids"][arrays["faces"][:, 0]]
+            for region in report["regions"]:
+                region["face_count"] = int(np.sum(arrays["face_region_ids"] == region["id"]))
+                region["inlier_count"] = int(np.sum(arrays["inlier"] & (arrays["region_ids"] == region["id"])))
+            report["region_annotations"] = str(args.regions.resolve()) if args.regions else "interactive"
         report.update({"input": str(args.pointcloud.resolve()), "coordinates": "camera",
                        "mesh_step": args.mesh_step, "max_relative_jump": args.max_relative_jump,
                        "face_count": len(arrays["faces"]),
                        "units": "input prediction units; no metric scale inferred"})
         output = args.output_dir
         output.mkdir(parents=True, exist_ok=True)
+        if annotation is not None:
+            from depth_anything_3.surface_regions import save_region_preview
+            (output / "regions.json").write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
+            (output / "regions_processed.json").write_text(json.dumps(model["annotation"], ensure_ascii=False, indent=2), encoding="utf-8")
+            save_region_preview(output, arrays, model["annotation"])
         for name, payload in (("model.json", model), ("report.json", report)):
             (output / name).write_text(
                 json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"

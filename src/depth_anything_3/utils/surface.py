@@ -49,8 +49,23 @@ def evaluate_surface(
     pixels = np.asarray(pixels_uv, dtype=float)
     if pixels.ndim != 2 or pixels.shape[1] != 2:
         raise ValueError("pixels_uv must have shape (N, 2)")
+    if model.get("type") == "piecewise_perspective_inverse_depth_bspline":
+        from depth_anything_3.utils.regions import region_ids_at_pixels
+        labels = region_ids_at_pixels(model["annotation"], pixels)
+        points = np.full((len(pixels), 3), np.nan)
+        normals = np.full_like(points, np.nan)
+        valid = np.zeros(len(pixels), bool)
+        for region in model["regions"]:
+            selected = labels == region["id"]
+            if selected.any():
+                points[selected], normals[selected], valid[selected] = evaluate_surface(
+                    region["surface"], pixels[selected], intrinsics,
+                )
+        return points, normals, valid
     h, w = model["image_shape"]
-    normalized = pixels / [w - 1, h - 1]
+    u0, v0, u1, v1 = model.get("pixel_bounds", [0, 0, w-1, h-1])
+    span = np.array([u1-u0, v1-v0])
+    normalized = (pixels - [u0, v0]) / span
     inside = np.isfinite(normalized).all(axis=1) & (normalized >= 0).all(axis=1)
     inside &= (normalized <= 1).all(axis=1)
     points = np.full((len(pixels), 3), np.nan)
@@ -66,8 +81,8 @@ def evaluate_surface(
     u, v = normalized[idx].T
     bu, bv = su(u), sv(v)
     g = np.einsum("ni,ij,nj->n", bv, coeff, bu)
-    gu = np.einsum("ni,ij,nj->n", bv, coeff, su(u, nu=1)) / (w - 1)
-    gv = np.einsum("ni,ij,nj->n", sv(v, nu=1), coeff, bu) / (h - 1)
+    gu = np.einsum("ni,ij,nj->n", bv, coeff, su(u, nu=1)) / span[0]
+    gv = np.einsum("ni,ij,nj->n", sv(v, nu=1), coeff, bu) / span[1]
     good = np.isfinite(g) & (g > 1e-8)
     idx, g, gu, gv = idx[good], g[good], gu[good], gv[good]
     Kinv = np.linalg.inv(np.asarray(intrinsics, dtype=float))
@@ -103,6 +118,8 @@ def fit_surface(
     relative_threshold: float = 0.05,
     validation_block: int = 8,
     seed: int = 42,
+    selection_mask: np.ndarray | None = None,
+    pixel_bounds: tuple[float, float, float, float] | None = None,
 ) -> tuple[dict, dict[str, np.ndarray], dict]:
     """Fit normalized inverse depth with Huber IRLS and control-net regularization.
 
@@ -144,6 +161,17 @@ def fit_surface(
             "Need max_samples >= 2 * controls_u * controls_v and positive iterations/block"
         )
     eligible = np.isfinite(points).all(axis=1) & (points[:, 2] > 0)
+    if selection_mask is not None:
+        selected = np.asarray(selection_mask)
+        if selected.shape != (len(points),) or selected.dtype.kind != "b":
+            raise ValueError("selection_mask must be a boolean array of length N")
+        eligible &= selected
+    bounds = np.asarray([0, 0, w-1, h-1] if pixel_bounds is None else pixel_bounds, float)
+    if (bounds.shape != (4,) or not np.isfinite(bounds).all() or
+        np.any(bounds[:2] < 0) or np.any(bounds[2:] > [w-1, h-1]) or np.any(bounds[2:] <= bounds[:2])):
+        raise ValueError("pixel_bounds must be increasing [u0,v0,u1,v1] within the image")
+    if np.any(pixels[eligible] < bounds[:2]) or np.any(pixels[eligible] > bounds[2:]):
+        raise ValueError("Eligible observations fall outside pixel_bounds")
     if confidence is not None:
         confidence = np.asarray(confidence, float)
         if confidence.shape != (len(points),):
@@ -176,7 +204,7 @@ def fit_surface(
     train[train_indices] = True
     scale = float(np.median(points[train, 2]))
     ku, kv = _knots(nu), _knots(nv)
-    A = _design(pixels[train] / [w - 1, h - 1], ku, kv)
+    A = _design((pixels[train]-bounds[:2]) / (bounds[2:]-bounds[:2]), ku, kv)
     target = scale / points[train, 2]
     penalty = _bending_penalty(nu, nv)
     regularization = smoothness * len(target) / (nu * nv)
@@ -210,6 +238,9 @@ def fit_surface(
         "coefficients": coefficients.reshape(nv, nu).tolist(), "intrinsics": K.tolist(),
         "support": "Use eligible/inlier masks in surface.npz; do not extrapolate hidden surfaces",
     }
+    if pixel_bounds is not None:
+        model["pixel_bounds"] = bounds.tolist()
+        model["parameterization"] = "local pixel bounding box; apply region polygon support"
     fitted, normals, evaluated = evaluate_surface(model, pixels, K)
     dz = fitted[:, 2] - points[:, 2]
     relative = np.full(len(points), np.nan)
@@ -252,6 +283,75 @@ def fit_surface(
     return model, arrays, report
 
 
+def fit_surface_regions(points, pixels_uv, intrinsics, image_shape, annotation, **kwargs):
+    """Fit independent local splines; preserve full input point order in combined output."""
+    from depth_anything_3.utils.regions import rasterize_regions
+
+    points, pixels = np.asarray(points, float), np.asarray(pixels_uv)
+    if points.ndim != 2 or points.shape[1] != 3 or pixels.shape != (len(points), 2):
+        raise ValueError("Expected points (N,3) and pixels_uv (N,2)")
+    h, w = image_shape
+    if (not np.isfinite(pixels).all() or np.any(pixels != np.floor(pixels)) or
+        np.any(pixels < 0) or np.any(pixels >= [w, h])):
+        raise ValueError("pixels_uv must contain integer coordinates inside image_shape")
+    pixels = pixels.astype(np.int32)
+    mask, processed = rasterize_regions(annotation, image_shape)
+    labels = mask[pixels[:, 1], pixels[:, 0]]
+    arrays = dict(points=points, pixels_uv=pixels, intrinsics=np.asarray(intrinsics, float),
+                  image_shape=np.asarray(image_shape), region_ids=labels, region_mask=mask)
+    for name in ("fitted_points", "normals"):
+        arrays[name] = np.full(points.shape, np.nan)
+    for name in ("depth_residual", "relative_depth_residual", "point_displacement"):
+        arrays[name] = np.full(len(points), np.nan)
+    for name in ("eligible", "evaluated", "inlier", "train", "validation"):
+        arrays[name] = np.zeros(len(points), bool)
+    models, reports = [], []
+    for region in processed["regions"]:
+        selected = labels == region["id"]
+        if not selected.any():
+            raise ValueError(f"Region {region['name']} contains no input points")
+        uv = pixels[selected]
+        bounds = [*uv.min(axis=0), *uv.max(axis=0)]
+        try:
+            model, local, report = fit_surface(
+                points, pixels, intrinsics, image_shape, selection_mask=selected,
+                pixel_bounds=bounds, **kwargs,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Region {region['name']}: {exc}") from exc
+        for name in ("fitted_points", "normals", "depth_residual", "relative_depth_residual",
+                     "point_displacement", "eligible", "evaluated", "inlier", "train", "validation"):
+            arrays[name][selected] = local[name][selected]
+        models.append(dict(id=region["id"], name=region["name"], surface=model))
+        reports.append(dict(id=region["id"], name=region["name"], point_count=int(selected.sum()),
+                            pixel_bounds=model["pixel_bounds"], **report))
+
+    def metrics(selected):
+        observed = selected & arrays["evaluated"] & np.isfinite(arrays["relative_depth_residual"])
+        values = arrays["relative_depth_residual"][observed]
+        return dict(count=int(selected.sum()), evaluated_count=int(observed.sum()),
+                    median_relative_depth_error=float(np.median(values)) if len(values) else None,
+                    p95_relative_depth_error=float(np.percentile(values, 95)) if len(values) else None,
+                    depth_rmse=float(np.sqrt(np.mean(arrays["depth_residual"][observed]**2))) if len(values) else None,
+                    inlier_fraction=float(arrays["inlier"][selected].mean()) if selected.any() else None)
+
+    model = dict(type="piecewise_perspective_inverse_depth_bspline", coordinates="camera",
+                 image_shape=[int(h), int(w)], intrinsics=np.asarray(intrinsics).tolist(),
+                 annotation=processed, regions=models,
+                 support="Evaluate only inside each polygon; also apply saved inlier mask")
+    report = {**{k: reports[0][k] for k in ("controls_uv", "smoothness", "relative_threshold",
+                                         "confidence_min", "seed", "validation_block_pixels")},
+              "method": model["type"], "regions": reports,
+              "iterations": max(r["iterations"] for r in reports),
+              "converged": all(r["converged"] for r in reports),
+              "all_eligible": metrics(arrays["eligible"]), "train": metrics(arrays["train"]),
+              "validation": metrics(arrays["validation"]),
+              "limitations": reports[0]["limitations"] + [
+                  "Independent region fits preserve user boundaries; no seam continuity is imposed.",
+                  "Polygon labels are user constraints, not verified physical surface identities."]}
+    return model, arrays, report
+
+
 def triangulate_surface(
     arrays: dict[str, np.ndarray], *, step: int = 3, max_relative_jump: float = 0.1,
 ) -> np.ndarray:
@@ -272,6 +372,14 @@ def triangulate_surface(
     z = np.full((h, w), np.nan)
     z[uv[valid, 1], uv[valid, 0]] = arrays["points"][valid, 2]
     bad = lookup < 0
+    region_map = None
+    if "region_ids" in arrays:
+        labels = np.asarray(arrays["region_ids"])
+        if labels.shape != valid.shape or labels.dtype.kind not in "iu" or np.any(labels < 0):
+            raise ValueError("region_ids must contain nonnegative integers, one per point")
+        region_map = np.zeros((h, w), dtype=labels.dtype)
+        region_map[uv[:, 1], uv[:, 0]] = labels
+        bad |= region_map == 0
     for axis in (0, 1):
         first, second = [slice(None), slice(None)], [slice(None), slice(None)]
         first[axis], second[axis] = slice(None, -1), slice(1, None)
@@ -279,6 +387,10 @@ def triangulate_surface(
         jump = np.abs(z[first] - z[second]) / np.minimum(z[first], z[second])
         bad[first] |= jump > max_relative_jump
         bad[second] |= jump > max_relative_jump
+        if region_map is not None:
+            boundary = region_map[first] != region_map[second]
+            bad[first] |= boundary
+            bad[second] |= boundary
     integral = np.pad(bad.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
     ys, xs = np.meshgrid(np.arange(0, h - step, step),
                          np.arange(0, w - step, step), indexing="ij")

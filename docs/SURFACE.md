@@ -4,6 +4,8 @@
 
 本版本采用**透视逆深度 B 样条曲面**。对当前图像进行初步几何试验时，平面与圆柱/锥面的距离分组不能可靠对应左右物理表面。因此这里先拟合可见几何，不把简单几何模型的分类当作真实部件分区。
 
+现在也支持通过 `--annotate-regions` 交互标注多边形，或用 `--regions regions.json` 读取人工分区。每个区域独立拟合，未标注区域排除，网格不跨区域连接。使用方法、标注格式和下游命令见 [人工多边形分区域拟合](SURFACE_REGIONS.md)。不指定区域时继续执行原有全局拟合。
+
 ## 运行
 
 在仓库根目录执行，本机已安装的 DA3 环境包含所需的 NumPy、SciPy 和 Matplotlib：
@@ -15,7 +17,7 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
   --output-dir outputs/surface
 ```
 
-在其他已安装依赖的环境中，可将解释器路径替换成 `python`。`--no-plots` 可跳过图表生成，此时仅需要 NumPy 和 SciPy。第一步 PLY 不包含像素关联和内参，因此这里读取 NPZ，不直接读取 PLY。
+在其他已安装依赖的环境中，可将解释器路径替换成 `python`。`--no-plots` 可跳过图表生成；全局拟合此时仅需要 NumPy 和 SciPy，分区模式还使用 Pillow 输出标注预览和区域掩码。第一步 PLY 不包含像素关联和内参，因此这里读取 NPZ，不直接读取 PLY。
 
 支持第一步的相机坐标与世界坐标点云；世界坐标输入会根据保存的 `world_to_camera` 转回相机坐标。本步骤所有输出均采用 OpenCV 相机坐标，尺度保持不变。
 

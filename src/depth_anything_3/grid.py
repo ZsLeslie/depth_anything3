@@ -262,7 +262,8 @@ def main():
                             visible_line_ids=vl, visible_pixels_uv=project(vv, data["intrinsics"]),
                             coordinates=np.asarray("camera"))
         np.savez_compressed(out / "coordinates.npz", **fields, inlier=data["inlier"],
-                            pixels_uv=data["pixels_uv"], coordinates=np.asarray("camera"))
+                            pixels_uv=data["pixels_uv"], coordinates=np.asarray("camera"),
+                            **({"region_ids": data["region_ids"]} if "region_ids" in data else {}))
         write_obj(out / "grid_curves.obj", visible, vf, vl)
         colors = np.concatenate([np.tile(curve_color(f, l), (len(p), 1))
                                  for p, f, l in zip(visible, vf, vl)]).astype(np.uint8) if visible else None
