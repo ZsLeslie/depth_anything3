@@ -48,6 +48,8 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
 
 输出继续兼容后续 grid：`axis.json` 增加 `axis_source: "camera_z"` 和绝对深度 `section_depths`；`report.json` 的轴线模型验证残差为 null，重采样次数为 0。截面形状诊断仍会执行。该模式用于比较查看方向的影响，不自动确认相机 Z 轴就是结构主轴。
 
+如需直接对原始点云切片，使用独立入口 `depth_anything_3.pointcloud_sections`，详见 [原始点云 Z 轴截面与投影](POINTCLOUD_SECTIONS.md)。该入口不读取 `surface.npz`，可通过 `--depths-from-axis` 复用相同截面深度。
+
 ## 输出文件
 
 | 文件 | 内容 |

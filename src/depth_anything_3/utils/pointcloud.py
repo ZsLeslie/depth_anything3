@@ -101,6 +101,48 @@ def depth_to_pointcloud(
     return result
 
 
+def triangulate_pointcloud(
+    points: np.ndarray, pixels_uv: np.ndarray, image_shape: tuple[int, int], *,
+    valid: np.ndarray | None = None, max_relative_jump: float = 0.1,
+) -> np.ndarray:
+    """Connect original adjacent-pixel vertices, without moving or fitting them.
+
+    A pixel quad needs all four observations. Triangles crossing a relative
+    camera-depth discontinuity are discarded. Sparse stride>1 observations
+    are not connected across unsampled pixels.
+    """
+    points, uv = np.asarray(points), np.asarray(pixels_uv)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (N,3)")
+    if len(image_shape) != 2 or any(int(n) != n or n < 2 for n in image_shape):
+        raise ValueError("image_shape must contain integer H,W >= 2")
+    h, w = map(int, image_shape)
+    if uv.shape != (len(points), 2) or uv.dtype.kind not in "iu":
+        raise ValueError("pixels_uv must have integer shape (N,2)")
+    if np.any(uv < 0) or np.any(uv >= [w, h]):
+        raise ValueError("pixels_uv falls outside image_shape")
+    if len(np.unique(uv[:, 1]*w+uv[:, 0])) != len(uv):
+        raise ValueError("Duplicate pixel observations are not supported")
+    if not np.isfinite(max_relative_jump) or max_relative_jump <= 0:
+        raise ValueError("max_relative_jump must be finite and positive")
+    eligible = np.isfinite(points).all(axis=1) & (points[:, 2] > 0)
+    if valid is not None:
+        valid = np.asarray(valid)
+        if valid.shape != (len(points),) or valid.dtype.kind != "b":
+            raise ValueError("valid must be a boolean array of length N")
+        eligible &= valid
+    lookup = np.full((h, w), -1, np.int32)
+    lookup[uv[eligible, 1], uv[eligible, 0]] = np.flatnonzero(eligible)
+    corners = np.stack((lookup[:-1, :-1], lookup[:-1, 1:],
+                        lookup[1:, :-1], lookup[1:, 1:]), axis=-1).reshape(-1, 4)
+    corners = corners[(corners >= 0).all(axis=1)]
+    faces = np.concatenate((corners[:, [0, 2, 1]], corners[:, [1, 2, 3]]))
+    if len(faces):
+        z = points[faces, 2]
+        faces = faces[np.ptp(z, axis=1)/z.min(axis=1) <= max_relative_jump]
+    return faces.astype(np.int32)
+
+
 def write_ply(
     path: str | Path, points: np.ndarray, colors: np.ndarray | None = None,
     *, faces: np.ndarray | None = None,
