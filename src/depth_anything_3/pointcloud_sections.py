@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
+# Include dependency imports in the CLI's total execution time.
+_SCRIPT_START = perf_counter()
+
 import argparse
 import json
 from pathlib import Path
@@ -328,4 +333,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        print(f"Total execution time: {perf_counter() - _SCRIPT_START:.3f} s")
