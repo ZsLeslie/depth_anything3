@@ -8,7 +8,7 @@ from pathlib import Path
 from time import perf_counter
 import numpy as np
 
-from depth_anything_3.utils.pointcloud import depth_to_pointcloud, write_ply
+from depth_anything_3.utils.pointcloud import confidence_to_colors, depth_to_pointcloud, write_ply
 
 
 def load_intrinsics(path: Path) -> np.ndarray:
@@ -156,12 +156,26 @@ def export_prediction(data: dict[str, np.ndarray], args: argparse.Namespace) -> 
     if args.coordinates == "world" and "extrinsics" not in arrays:
         raise ValueError("World coordinates require DA3 world-to-camera extrinsics")
 
+    color_by = getattr(args, "color_by", "rgb")
+    color_range = getattr(args, "confidence_color_range", None)
+    if color_by == "confidence":
+        if "conf" not in arrays:
+            raise ValueError("--color-by confidence requires a confidence map (conf)")
+        if color_range is None:
+            # Use one scale for the input batch, independent of sampling/filter settings.
+            eligible = np.isfinite(depth) & (depth > 0) & np.isfinite(arrays["conf"])
+            values = arrays["conf"][eligible]
+            if values.size:
+                color_range = [float(values.min()), float(values.max())]
+
     summary = {
         "coordinates": args.coordinates,
         "camera_axes": "x right, y down, z forward",
         "is_metric": bool(np.asarray(data["is_metric"]).item()) if "is_metric" in data else None,
         "depth_shape": list(depth.shape),
         "confidence_min": args.confidence_min, "max_depth": args.max_depth,
+        "color_by": color_by, "confidence_color_range": color_range,
+        "confidence_colormap": "red-yellow-green" if color_by == "confidence" else None,
         "stride": args.stride, "frames": [],
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +188,17 @@ def export_prediction(data: dict[str, np.ndarray], args: argparse.Namespace) -> 
             confidence_min=args.confidence_min, max_depth=args.max_depth, stride=args.stride,
             world_to_camera=arrays["extrinsics"][i] if args.coordinates == "world" else None,
         )
+        cloud["color_by"] = np.asarray(color_by)
+        if color_by == "confidence":
+            if "colors" in cloud:
+                cloud["rgb_colors"] = cloud["colors"]
+            cloud["colors"] = (
+                confidence_to_colors(cloud["confidence"], color_range)
+                if len(cloud["confidence"]) else np.empty((0, 3), dtype=np.uint8)
+            )
+            cloud["confidence_color_range"] = np.asarray(
+                color_range if color_range is not None else [], dtype=np.float64,
+            )
         conversion_seconds = perf_counter() - conversion_start
         save_start = perf_counter()
         stem = f"frame_{i:04d}"
@@ -217,6 +242,14 @@ def main() -> None:
     )
     parser.add_argument("--coordinates", choices=("camera", "world"), default="camera")
     parser.add_argument(
+        "--color-by", choices=("rgb", "confidence"), default="rgb",
+        help="Point colors: source RGB (default) or confidence (low red, high green)",
+    )
+    parser.add_argument(
+        "--confidence-color-range", nargs=2, type=float, metavar=("MIN", "MAX"),
+        help="Raw confidence range for coloring; default: input-batch min/max",
+    )
+    parser.add_argument(
         "--confidence-min", type=float, help="Raw DA3 confidence threshold, not a probability"
     )
     parser.add_argument("--max-depth", type=float, help="Maximum camera z in prediction units")
@@ -226,6 +259,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.process_res < 14 or args.stride < 1:
         parser.error("process-res must be >= 14 and stride must be >= 1")
+    if args.confidence_color_range is not None:
+        if args.color_by != "confidence":
+            parser.error("confidence-color-range requires --color-by confidence")
+        low, high = args.confidence_color_range
+        if not np.isfinite([low, high]).all() or low >= high:
+            parser.error("confidence-color-range requires finite MIN < MAX")
     if args.intrinsics_size is not None:
         if args.intrinsics is None:
             parser.error("intrinsics-size requires --intrinsics")

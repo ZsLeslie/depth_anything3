@@ -88,6 +88,28 @@ PYTHONPATH=src python -m depth_anything_3.pointcloud \
 
 全被过滤时会输出空点云并提示，不自动放宽阈值。相同输出目录、相同文件名会覆盖已有结果；不同试验建议使用不同目录。
 
+## 按深度置信度着色
+
+添加 `--color-by confidence` 后，点的颜色由原始深度置信度决定：**范围下限为红色，中点为黄色，上限为绿色**。默认 `--color-by rgb` 继续使用 RGB 图像颜色。
+
+已有预测可以直接重新导出置信度着色点云：
+
+```bash
+PYTHONPATH=src python -m depth_anything_3.pointcloud \
+  --prediction outputs/pointcloud_K/prediction.npz \
+  --color-by confidence \
+  --output-dir outputs/pointcloud_K_confidence
+```
+
+默认颜色范围取整个输入批次中有效正深度、有限置信度像素的置信度最小值和最大值。所有帧共享此范围；后续点数采样、`--confidence-min` 和 `--max-depth` 不改变色标。若所有值相同，使用中间的黄色。缺少 `conf` 字段时明确报错。
+
+不同批次需要直接比较时，可以固定颜色范围，例如添加 `--confidence-color-range 1 5.5`。低于下限的值显示红色，高于上限的值显示绿色。该参数控制颜色，不负责过滤点，且必须与 `--color-by confidence` 一起使用。DA3 原始置信度不是 0～1 的正确概率，颜色只反映指定范围内的分数高低。
+
+- PLY 的顶点颜色为置信度颜色。
+- 点云 NPZ 的 `colors` 保存相同的置信度颜色；`confidence` 保留原始分数，有 RGB 时额外以 `rgb_colors` 保存原始颜色。
+- NPZ 保存 `color_by`、`confidence_color_range`；`summary.json` 保存实际使用的范围和 `red-yellow-green` 色标名称。没有任何有效深度/置信度像素时，自动范围为 null，仍可以导出空点云。
+- 从图像开始推理时，保存的 `prediction.npz` 中 `image` 仍是处理后的 RGB，可继续用于其他着色方式。
+
 ## 几何验证
 
 ```bash

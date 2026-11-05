@@ -6,6 +6,27 @@ from pathlib import Path
 import numpy as np
 
 
+def confidence_to_colors(confidence: np.ndarray, value_range) -> np.ndarray:
+    """Map raw confidence to RGB: low red, midpoint yellow, high green."""
+    values = np.asarray(confidence, dtype=np.float64)
+    bounds = np.asarray(value_range, dtype=np.float64)
+    if values.ndim != 1 or not np.isfinite(values).all():
+        raise ValueError("confidence colors require a finite 1D confidence array")
+    if (bounds.shape != (2,) or not np.isfinite(bounds).all()
+            or bounds[1] < bounds[0]):
+        raise ValueError("confidence color range must contain finite MIN <= MAX")
+    if bounds[0] == bounds[1]:
+        normalized = np.full(values.shape, 0.5)
+    else:
+        normalized = np.clip((values-bounds[0])/(bounds[1]-bounds[0]), 0, 1)
+    colors = np.column_stack((
+        np.interp(normalized, [0, 0.5, 1], [255, 255, 0]),
+        np.interp(normalized, [0, 0.5, 1], [0, 255, 255]),
+        np.zeros(len(values)),
+    ))
+    return np.rint(colors).astype(np.uint8)
+
+
 def depth_to_pointcloud(
     depth: np.ndarray,
     intrinsics: np.ndarray,
