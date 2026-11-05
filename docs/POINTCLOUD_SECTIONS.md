@@ -39,9 +39,25 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
 也可以手动设置：
 
 - `--z-range MIN MAX --sections N`：在指定的正深度区间等距放置平面。
+- `--z-range-percent MIN MAX --sections N`：按有效网格顶点的最小到最大 Z 区间指定百分比位置。0 表示最小 Z，100 表示最大 Z；换算公式为 `Z(p) = Z_min + (Z_max-Z_min)*p/100`。
+- `--z-percentiles MIN MAX --sections N`：按有效网格顶点 Z 分布的百分位指定区间边界。例如 10、90 表示第 10 和第 90 百分位，比最小/最大值更不容易受极端深度影响。区间内的截面仍按 Z 等距分布，不保证各截面之间点数相等。
 - `--section-depths Z1 Z2 ...`：指定 2～100 个严格递增的正深度值，此时数量取自列表。
 
-`--z-range`、`--section-depths`、`--depths-from-axis` 三者互斥。所有深度沿用预测单位，非米制点云不能按厘米或米解释。
+上述四个范围/位置参数与 `--depths-from-axis` 互斥。百分比须满足 `0 <= MIN < MAX <= 100`，统计只使用参与有效网格的顶点，并在统计前去掉重复顶点编号。无参数时继续使用第 12～88 百分位范围。所有深度沿用预测单位，非米制点云不能按厘米或米解释。
+
+例如在 Z 区间 10%～80% 的位置范围内等距绘制 8 个截面：
+
+```bash
+PYTHONPATH=src python -m depth_anything_3.pointcloud_sections \
+  --pointcloud outputs/pointcloud_K/frame_0000.npz \
+  --z-range-percent 10 80 \
+  --sections 8 \
+  --output-dir outputs/pointcloud_sections_K
+```
+
+若需要按点云分布去掉最近 10% 和最远 20% 的点，将 `--z-range-percent 10 80` 换成 `--z-percentiles 10 80`。两者结果通常不同；例如 Z 最小为 1、最大为 9，区间 25%～75% 对应 `[3, 7]`，而百分位范围还取决于各处的点数分布。使用 0 或 100 时，边界平面可能只接触少数极值点，未必形成可见曲线。
+
+`report.json` 保存请求的 `z_range_percent` 或 `z_percentiles`，以及换算后的绝对 `section_depths`，便于核对实际绘制位置。
 
 ## 计算流程
 

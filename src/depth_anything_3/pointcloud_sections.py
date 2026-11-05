@@ -62,7 +62,12 @@ def load_raw_cloud(path, *, confidence_min=None):
             "input_coordinates": coordinates, "coordinates": np.asarray("camera")}
 
 
-def section_depths(data, faces, *, count=5, z_range=None, depths=None, reference_axis=None):
+def section_depths(data, faces, *, count=5, z_range=None, depths=None, reference_axis=None,
+                   z_range_percent=None, z_percentiles=None):
+    if sum(value is not None for value in (
+        z_range, depths, reference_axis, z_range_percent, z_percentiles,
+    )) > 1:
+        raise ValueError("Section placement options are mutually exclusive")
     if reference_axis is not None:
         if reference_axis.get("coordinates") != "camera":
             raise ValueError("Reference axis must be in camera coordinates")
@@ -79,8 +84,24 @@ def section_depths(data, faces, *, count=5, z_range=None, depths=None, reference
         if depths is None:
             depths = np.asarray(reference_axis["section_levels"])+reference_axis["point"][2]
     if depths is None:
-        bounds = (np.percentile(data["points"][np.unique(faces), 2], [12, 88])
-                  if z_range is None else np.asarray(z_range, float))
+        if z_range_percent is not None or z_percentiles is not None:
+            name = "z-range-percent" if z_range_percent is not None else "z-percentiles"
+            percentages = np.asarray(
+                z_range_percent if z_range_percent is not None else z_percentiles, float,
+            )
+            if (percentages.shape != (2,) or not np.isfinite(percentages).all()
+                    or np.any(percentages < 0) or np.any(percentages > 100)
+                    or percentages[0] >= percentages[1]):
+                raise ValueError(f"{name} requires 0 <= MIN < MAX <= 100")
+            observed_z = data["points"][np.unique(faces), 2]
+            if z_range_percent is not None:
+                low, high = observed_z.min(), observed_z.max()
+                bounds = low + (high-low)*percentages/100
+            else:
+                bounds = np.percentile(observed_z, percentages)
+        else:
+            bounds = (np.percentile(data["points"][np.unique(faces), 2], [12, 88])
+                      if z_range is None else np.asarray(z_range, float))
         if np.shape(bounds) != (2,) or not np.isfinite(bounds).all() or bounds[0] <= 0 or bounds[1] <= bounds[0]:
             raise ValueError("z-range must contain increasing positive finite bounds")
         depths = np.linspace(*bounds, count)
@@ -173,6 +194,10 @@ def main():
     parser.add_argument("--sections", type=int, default=5)
     placement = parser.add_mutually_exclusive_group()
     placement.add_argument("--z-range", nargs=2, type=float, help="Absolute Z bounds")
+    placement.add_argument("--z-range-percent", nargs=2, type=float, metavar=("MIN", "MAX"),
+                           help="Percent positions in the supported Z span: 0=min Z, 100=max Z")
+    placement.add_argument("--z-percentiles", nargs=2, type=float, metavar=("MIN", "MAX"),
+                           help="Percentile bounds of supported Z values, between 0 and 100")
     placement.add_argument("--section-depths", nargs="+", type=float, help="Explicit depths, overrides --sections")
     placement.add_argument("--depths-from-axis", type=Path, help="Use matching camera-Z axis JSON section depths")
     parser.add_argument("--max-relative-jump", type=float, default=.1)
@@ -204,7 +229,8 @@ def main():
             raise ValueError("No adjacent-pixel triangles remain; use a dense --stride 1 point cloud or inspect depth filtering")
         reference = json.loads(args.depths_from_axis.read_text()) if args.depths_from_axis else None
         depths = section_depths(data, faces, count=args.sections, z_range=args.z_range,
-                                depths=args.section_depths, reference_axis=reference)
+                                depths=args.section_depths, reference_axis=reference,
+                                z_range_percent=args.z_range_percent, z_percentiles=args.z_percentiles)
         colors = section_colors(len(depths))
         h, w = data["image_shape"]
         support, depth = np.zeros((h, w), bool), np.full((h, w), np.nan)
@@ -253,6 +279,7 @@ def main():
                       point_count=len(points), valid_points=int(valid.sum()), mesh_faces=len(faces),
                       mesh_vertices_used=len(np.unique(faces)), max_relative_jump=args.max_relative_jump,
                       confidence_min=args.confidence_min, section_depths=depths.tolist(),
+                      z_range_percent=args.z_range_percent, z_percentiles=args.z_percentiles,
                       depths_from_axis=str(args.depths_from_axis.resolve()) if args.depths_from_axis else None,
                       geometric_components=len(paths), visible_fragments=len(visible), lines=details,
                       visibility_tolerance=args.visibility_tolerance, min_length_px=args.min_length_px,
