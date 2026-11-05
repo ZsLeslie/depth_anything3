@@ -11,7 +11,58 @@ import numpy as np
 from depth_anything_3.utils.pointcloud import depth_to_pointcloud, write_ply
 
 
-def predict_images(args: argparse.Namespace) -> dict[str, np.ndarray]:
+def load_intrinsics(path: Path) -> np.ndarray:
+    """Read a shared or per-frame pinhole K from JSON or a NumPy array."""
+    if path.suffix.lower() == ".json":
+        with path.open(encoding="utf-8") as handle:
+            value = json.load(handle)
+        if isinstance(value, dict):
+            value = value.get("intrinsics", value.get("K"))
+    elif path.suffix.lower() == ".npy":
+        value = np.load(path, allow_pickle=False)
+    else:
+        raise ValueError("intrinsics must be a .json or .npy file")
+    try:
+        matrices = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("intrinsics must contain numeric 3x3 matrices") from exc
+    if matrices.shape == (3, 3):
+        batch = matrices[None]
+    elif matrices.ndim == 3 and matrices.shape[1:] == (3, 3) and len(matrices):
+        batch = matrices
+    else:
+        raise ValueError("intrinsics must have shape (3, 3) or (N, 3, 3)")
+    if not np.isfinite(batch).all():
+        raise ValueError("intrinsics must be finite")
+    if (not np.allclose(batch[:, 2], [0, 0, 1])
+            or np.any(batch[:, 0, 0] <= 0) or np.any(batch[:, 1, 1] <= 0)):
+        raise ValueError("intrinsics must be pinhole matrices with positive focal lengths")
+    if np.any(np.linalg.slogdet(batch)[0] == 0):
+        raise ValueError("intrinsics must be invertible")
+    return matrices
+
+
+def intrinsics_for_frames(intrinsics: np.ndarray, count: int) -> np.ndarray:
+    matrices = intrinsics[None] if intrinsics.ndim == 2 else intrinsics
+    if len(matrices) == 1:
+        return np.repeat(matrices, count, axis=0)
+    if len(matrices) != count:
+        raise ValueError(f"intrinsics contains {len(matrices)} matrices for {count} frames")
+    return matrices.copy()
+
+
+def resize_intrinsics(intrinsics: np.ndarray, source_size, target_size) -> np.ndarray:
+    """Map K between image resolutions for resize-only transforms (sizes are W,H)."""
+    result = intrinsics.copy()
+    sx, sy = np.asarray(target_size, dtype=float) / source_size
+    result[..., 0, :] *= sx
+    result[..., 1, :] *= sy
+    return result
+
+
+def predict_images(
+    args: argparse.Namespace, intrinsics: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     initialization_start = perf_counter()
     # Keep conversion of existing predictions usable with NumPy alone.
     import torch
@@ -25,6 +76,18 @@ def predict_images(args: argparse.Namespace) -> dict[str, np.ndarray]:
     )
     if not paths or any(not p.is_file() or p.suffix.lower() not in extensions for p in paths):
         raise ValueError(f"No supported images found at {root}")
+    inference_kwargs = {}
+    if intrinsics is not None:
+        matrices = intrinsics_for_frames(intrinsics, len(paths))
+        if args.intrinsics_size is not None:
+            from PIL import Image
+            for i, path in enumerate(paths):
+                with Image.open(path) as image:
+                    matrices[i] = resize_intrinsics(
+                        matrices[i], args.intrinsics_size, image.size,
+                    )
+        # The API applies the same resize and batch center-crop to images and K.
+        inference_kwargs["intrinsics"] = matrices
     device = args.device
     use_cuda = device.startswith("cuda")
     if use_cuda and not torch.cuda.is_available():
@@ -45,6 +108,7 @@ def predict_images(args: argparse.Namespace) -> dict[str, np.ndarray]:
     prediction = model.inference(
         [str(p) for p in paths], process_res=args.process_res,
         process_res_method="upper_bound_resize",
+        **inference_kwargs,
     )
     if use_cuda:
         # CUDA work is asynchronous; wait for completion before recording elapsed time.
@@ -142,6 +206,15 @@ def main() -> None:
     parser.add_argument("--model-dir", default="depth-anything/DA3-BASE")
     parser.add_argument("--device", default="cuda", help="Inference device (default: cuda)")
     parser.add_argument("--process-res", type=int, default=504)
+    parser.add_argument(
+        "--intrinsics", type=Path,
+        help="Custom K: JSON/NPY (3,3) or (N,3,3); defaults to original-image pixels "
+             "with --images, depth-image pixels with --prediction",
+    )
+    parser.add_argument(
+        "--intrinsics-size", nargs=2, type=int, metavar=("WIDTH", "HEIGHT"),
+        help="Calibration image size for custom K; rescale K from this resolution",
+    )
     parser.add_argument("--coordinates", choices=("camera", "world"), default="camera")
     parser.add_argument(
         "--confidence-min", type=float, help="Raw DA3 confidence threshold, not a probability"
@@ -153,15 +226,33 @@ def main() -> None:
     args = parser.parse_args()
     if args.process_res < 14 or args.stride < 1:
         parser.error("process-res must be >= 14 and stride must be >= 1")
+    if args.intrinsics_size is not None:
+        if args.intrinsics is None:
+            parser.error("intrinsics-size requires --intrinsics")
+        if min(args.intrinsics_size) < 1:
+            parser.error("intrinsics-size width and height must be positive")
     total_start = perf_counter()
     try:
+        intrinsics = load_intrinsics(args.intrinsics) if args.intrinsics is not None else None
         if args.prediction is not None:
             with np.load(args.prediction, allow_pickle=False) as archive:
                 data = dict(archive)
+            if intrinsics is not None:
+                if "depth" not in data:
+                    raise ValueError("Prediction requires depth")
+                depth = np.asarray(data["depth"])
+                if depth.ndim not in (2, 3) or not depth.size:
+                    raise ValueError("depth must have shape (N, H, W) or (H, W)")
+                matrices = intrinsics_for_frames(intrinsics, 1 if depth.ndim == 2 else len(depth))
+                if args.intrinsics_size is not None:
+                    matrices = resize_intrinsics(
+                        matrices, args.intrinsics_size, depth.shape[-2:][::-1],
+                    )
+                data["intrinsics"] = matrices
             source_seconds = perf_counter() - total_start
             print(f"Prediction loading: {source_seconds:.3f} s")
         else:
-            data = predict_images(args)
+            data = predict_images(args, intrinsics)
             source_seconds = perf_counter() - total_start
             print(f"Image prediction total (includes stages above): {source_seconds:.3f} s")
         export_start = perf_counter()
