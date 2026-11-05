@@ -28,6 +28,28 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
 
 自动方向采用 `[tx,ty,1]` 归一化，`tx,ty` 限制在 [-2,2]，适用于朝结构内部拍摄的视角；达到边界会提示可能退化。它不适合近乎横向观察的结构。三维曲线轴、椭圆截面轴及扭转中心线尚不在此版本范围内。
 
+## 固定使用相机 Z 轴查看截面
+
+可跳过轴线估计，直接使用相机光轴 `x=y=0`、方向 `[0,0,1]`：
+
+```bash
+PYTHONPATH=src MPLCONFIGDIR=/tmp/da3-matplotlib OPENBLAS_NUM_THREADS=1 \
+  /home/nvidia/venvs/da3_env/bin/python -m depth_anything_3.axis \
+  --surface outputs/surface/surface.npz \
+  --camera-z-axis \
+  --output-dir outputs/axis_z
+```
+
+此模式不拟合圆柱/圆锥轴线，也不进行轴线重采样。轴上参考点使用 `[0,0,有效网格顶点的中位Z]`，它始终位于相机 Z 轴上；截平面是 `Z=常数`，位置仍取网格轴向坐标的 12%～88% 分位范围，再等距放置默认 5 个平面。`--sections` 可调整数量。
+
+`--camera-z-axis` 同时固定方向与位置；原有 `--direction 0 0 1` 只固定方向，仍会估计轴线位置。Z 轴模式不能与其他轴线参数或参考线标注组合。
+
+相机 Z 轴在二维图像中投影到主点 `[cx,cy]`，因此以叉号显示，不会出现一条有长度的轴线投影。三维图仍会显示轴线。截线继续由拟合表面网格求交得到，保留原有孔洞及分区断开。
+
+输出继续兼容后续 grid：`axis.json` 增加 `axis_source: "camera_z"` 和绝对深度 `section_depths`；`report.json` 的轴线模型验证残差为 null，重采样次数为 0。截面形状诊断仍会执行。该模式用于比较查看方向的影响，不自动确认相机 Z 轴就是结构主轴。
+
+如需直接对原始点云切片，使用独立入口 `depth_anything_3.pointcloud_sections`，详见 [原始点云 Z 轴截面与投影](POINTCLOUD_SECTIONS.md)。该入口不读取 `surface.npz`，可通过 `--depths-from-axis` 复用相同截面深度。
+
 ## 输出文件
 
 | 文件 | 内容 |

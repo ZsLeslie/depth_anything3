@@ -33,6 +33,25 @@ def axis_basis(direction):
     return first, np.cross(a, first)
 
 
+def camera_z_axis(points):
+    """Fixed camera optical axis; use a positive reference depth for visualization."""
+    points = np.asarray(points, float)
+    if (points.ndim != 2 or points.shape[1] != 3 or not len(points) or
+            not np.isfinite(points).all() or np.any(points[:, 2] <= 0)):
+        raise ValueError("Camera Z preview requires finite points with positive depth")
+    z = float(np.median(points[:, 2]))
+    axis = dict(point=[0., 0., z], direction=[0., 0., 1.], coordinates="camera",
+                reference_z=z, candidate_model="fixed_camera_z", axis_source="camera_z",
+                manual_direction=True, manual_position=True)
+    report = dict(status="needs_review", accepted_as_physical_axis=False,
+                  axis_source="camera_z", selected_validation=None,
+                  stability=dict(requested=0, successful=0, direction_p95_degrees=None,
+                                 position_p95_over_radius=None, competing_candidate_max_angle_degrees=None,
+                                 interpretation="Not applicable: the camera Z axis is fixed, not estimated"),
+                  warnings=["Camera Z is a fixed viewing-axis reference; it is not an estimated structure axis"])
+    return axis, report, np.empty((0, 6))
+
+
 def direction_from_parallel_lines(annotation, intrinsics, image_shape):
     """Estimate direction from explicitly annotated physically parallel straight lines.
 

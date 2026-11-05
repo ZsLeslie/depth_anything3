@@ -347,9 +347,11 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         ransac_view_thresh: int = 10,
     ) -> Prediction:
         """Align depth map to input extrinsics"""
+        # Keep the supplied, preprocessed K even when poses are not provided.
+        if intrinsics is not None:
+            prediction.intrinsics = intrinsics.numpy()
         if extrinsics is None:
             return prediction
-        prediction.intrinsics = intrinsics.numpy()
         _, _, scale, aligned_extrinsics = align_poses_umeyama(
             prediction.extrinsics,
             extrinsics.numpy(),

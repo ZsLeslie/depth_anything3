@@ -27,7 +27,43 @@ PYTHONPATH=src python -m depth_anything_3.pointcloud \
   --output-dir outputs/pointcloud
 ```
 
-必需字段为 `depth`（N,H,W）和 `intrinsics`（N,3,3）；可选 `image`（N,H,W,3，uint8 RGB）、`conf`（N,H,W）、`extrinsics`（N,3,4 或 N,4,4）。单帧也支持去掉 N 维。所有字段必须来自同一处理分辨率；原图不能未经对应的缩放、裁剪就直接用于着色。
+必需字段为 `depth`（N,H,W）和 `intrinsics`（N,3,3）；使用下述 `--intrinsics` 时，NPZ 可以不含内参。可选 `image`（N,H,W,3，uint8 RGB）、`conf`（N,H,W）、`extrinsics`（N,3,4 或 N,4,4）。单帧也支持去掉 N 维。所有字段必须来自同一处理分辨率；原图不能未经对应的缩放、裁剪就直接用于着色。
+
+## 指定相机内参 K
+
+通过 `--intrinsics camera_K.json` 或 `--intrinsics camera_K.npy` 传入内参，覆盖模型预测或输入 NPZ 的内参。文件支持单个 `3×3` 矩阵（所有帧共用），或 `N×3×3` 矩阵（逐帧对应输入顺序；图片目录按文件名排序）。JSON 也支持 `{"K": ...}` 或 `{"intrinsics": ...}`。
+
+例如下面的 JSON 表示一组 **1920×1080 标定分辨率下的示例值，需替换为实际标定结果**：
+
+```json
+[
+  [1400.0, 0.0, 960.0],
+  [0.0, 1400.0, 540.0],
+  [0.0, 0.0, 1.0]
+]
+```
+
+```bash
+PYTHONPATH=src python -m depth_anything_3.pointcloud \
+  --images images/1920_45_000001.jpg \
+  --model-dir ~/models/DA3-LARGE/ \
+  --intrinsics camera_K.json \
+  --intrinsics-size 1920 1080 \
+  --output-dir outputs/1920/pointcloud_custom_K
+```
+
+- 从图像推理：未传 `--intrinsics-size` 时，K 按每张原图的像素坐标解释；传入该参数时，先从指定标定分辨率缩放到各原图尺寸。随后由 DA3 预处理同步执行图像和 K 的缩放及批次中心裁剪。最终 `prediction.npz` 和每帧点云 NPZ 保存实际用于反投影的处理后 K。
+- 从已有预测恢复：未传 `--intrinsics-size` 时，K 按深度图的像素坐标解释；传入该参数时，按宽高比例缩放到深度图尺寸。例如仅有缩放的 1920×1080 → 504×280，使用 `K_depth = diag(504/1920, 280/1080, 1) @ K`。**已有预测若还包含裁剪，此参数不能恢复未知裁剪偏移；应先计算处理后 K，再不带 `--intrinsics-size` 传入。**
+
+```bash
+PYTHONPATH=src python -m depth_anything_3.pointcloud \
+  --prediction outputs/1920/pointcloud/prediction.npz \
+  --intrinsics camera_K.json \
+  --intrinsics-size 1920 1080 \
+  --output-dir outputs/1920/pointcloud_custom_K
+```
+
+内参须为有限、可逆的针孔矩阵，焦距为正，最后一行为 `[0, 0, 1]`。本接口不接收畸变系数；K 应与实际输入图像的成像几何一致。指定 K 不会自动把非米制深度转换为米制深度。
 
 ## 输出与坐标约定
 
@@ -55,10 +91,10 @@ PYTHONPATH=src python -m depth_anything_3.pointcloud \
 ## 几何验证
 
 ```bash
-PYTHONPATH=src python -m pytest -q tests/test_pointcloud.py
+PYTHONPATH=src python -m pytest -q tests/test_pointcloud.py tests/test_api_intrinsics.py
 ```
 
-测试覆盖平面反投影及重投影、无效深度过滤、采样与颜色对应、外参方向、二进制 PLY、空点云、标准 NPZ/mini_npz 命令行导出和缺失内参错误。它们验证坐标转换与导出逻辑，不代表实际图像上的深度估计精度。
+测试覆盖平面反投影及重投影、无效深度过滤、采样与颜色对应、外参方向、二进制 PLY、空点云、标准 NPZ/mini_npz 命令行导出、缺失内参错误，以及自定义 K、标定尺寸缩放和批次裁剪后的内参一致性。API 测试需要图像推理依赖，缺少时跳过。它们验证坐标转换与导出逻辑，不代表实际图像上的深度估计精度。
 
 本机已用以下命令对 `images/1920_45_000001.jpg` 完成验证：
 
